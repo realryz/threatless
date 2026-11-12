@@ -26,6 +26,15 @@ namespace ThreatlessResource
         private static readonly Regex KeyFormat = new Regex("^tl_game_[0-9a-f]{32}\\..+$", RegexOptions.Compiled);
         private static readonly JsonSerializerSettings AsciiJson = new JsonSerializerSettings { StringEscapeHandling = StringEscapeHandling.EscapeNonAscii };
 
+        private sealed class Connection
+        {
+            public long Seq;
+            public string Name;
+            public string License;
+            public string DropKind;
+            public string DropAt;
+        }
+
         private sealed class Batch
         {
             public long Seq;
@@ -37,8 +46,7 @@ namespace ThreatlessResource
         private readonly IHost _host;
         private readonly BridgeConfig _config;
         private readonly LinkedList<GameEvent> _queue = new LinkedList<GameEvent>();
-        private readonly Dictionary<int, long> _connections = new Dictionary<int, long>();
-        private readonly Dictionary<int, string> _names = new Dictionary<int, string>();
+        private readonly Dictionary<int, Connection> _connections = new Dictionary<int, Connection>();
         private readonly Random _random = new Random();
         private const string KvpPrivateKey = "threatless:private_key";
         private const string KvpApiKey = "threatless:api_key";
@@ -167,54 +175,76 @@ namespace ThreatlessResource
 
         private static string Plain(string text) => ConsoleUnsafe.Replace(text ?? "", "");
 
-        private void AnnounceConnected(int source)
+        private void AnnounceConnected(int source, Dictionary<string, string> identifiers)
         {
-            var seq = ++_connectionSeq;
-            var name = Truncate(_host.PlayerName(source), 128);
-            _connections[source] = seq;
-            _names[source] = name;
+            var connection = new Connection
+            {
+                Seq = ++_connectionSeq,
+                Name = Truncate(_host.PlayerName(source), 128),
+                License = LicenseOf(identifiers),
+            };
+            _connections[source] = connection;
             Enqueue(new GameEvent
             {
                 Type = "player.connected",
                 SourceId = source,
-                ConnectionSeq = seq,
-                Name = name,
+                ConnectionSeq = connection.Seq,
+                Name = connection.Name,
                 OccurredAt = Now(),
-                Identifiers = Identifiers.Parse(_host.PlayerIdentifiers(source)),
+                Identifiers = identifiers,
             });
         }
 
+        private static string LicenseOf(Dictionary<string, string> identifiers) =>
+            identifiers.TryGetValue("license", out var license) ? license : null;
+
         public void PlayerJoined(int source)
         {
-            if (!_started || _connections.ContainsKey(source)) return;
+            if (!_started) return;
+            var identifiers = Identifiers.Parse(_host.PlayerIdentifiers(source));
+            if (_connections.TryGetValue(source, out var known))
+            {
+                var license = LicenseOf(identifiers);
+                var same = license != null || known.License != null
+                    ? license == known.License
+                    : Truncate(_host.PlayerName(source), 128) == known.Name;
+                if (same) return;
+                Close(source, known, known.DropKind ?? "quit", known.DropAt ?? Now());
+            }
             _host.Log("info", $"Spieler verbunden: {Plain(_host.PlayerName(source))} (ID {source})");
-            AnnounceConnected(source);
+            AnnounceConnected(source, identifiers);
         }
 
         private static readonly int[] DropChecksMs = { 1000, 4000, 10000 };
 
         public void PlayerDropped(int source, string reason)
         {
-            if (!_started || !_connections.TryGetValue(source, out var seq)) return;
-            ConfirmDrop(source, seq, ClassifyDrop(reason), Now(), 0);
+            if (!_started || !_connections.TryGetValue(source, out var connection)) return;
+            connection.DropKind = ClassifyDrop(reason);
+            connection.DropAt = Now();
+            ConfirmDrop(source, connection, 0);
         }
 
-        private void ConfirmDrop(int source, long seq, string kind, string occurredAt, int attempt)
+        private void ConfirmDrop(int source, Connection connection, int attempt)
         {
             _host.After(DropChecksMs[attempt], () => Safe("playerDropped", () =>
             {
-                if (!_connections.TryGetValue(source, out var current) || current != seq) return;
+                if (!_connections.TryGetValue(source, out var current) || current != connection) return;
                 if (_host.Players.Contains(source))
                 {
-                    if (attempt + 1 < DropChecksMs.Length) ConfirmDrop(source, seq, kind, occurredAt, attempt + 1);
+                    if (attempt + 1 < DropChecksMs.Length) ConfirmDrop(source, connection, attempt + 1);
+                    else connection.DropKind = connection.DropAt = null;
                     return;
                 }
-                _connections.Remove(source);
-                _names.TryGetValue(source, out var name);
-                _names.Remove(source);
-                _host.Log("info", $"Spieler getrennt: {Plain(name)} (ID {source}, {kind})");
-                Enqueue(new GameEvent { Type = "player.disconnected", SourceId = source, ConnectionSeq = seq, OccurredAt = occurredAt, Reason = kind });
+                Close(source, connection, connection.DropKind, connection.DropAt);
             }));
+        }
+
+        private void Close(int source, Connection connection, string kind, string occurredAt)
+        {
+            _connections.Remove(source);
+            _host.Log("info", $"Spieler getrennt: {Plain(connection.Name)} (ID {source}, {kind})");
+            Enqueue(new GameEvent { Type = "player.disconnected", SourceId = source, ConnectionSeq = connection.Seq, OccurredAt = occurredAt, Reason = kind });
         }
 
         public static string ClassifyDrop(string reason)
@@ -241,7 +271,7 @@ namespace ThreatlessResource
             {
                 Type = "presence.snapshot",
                 OccurredAt = Now(),
-                Players = _connections.Select(c => new KeyValuePair<int, long>(c.Key, c.Value)).ToList(),
+                Players = _connections.Select(c => new KeyValuePair<int, long>(c.Key, c.Value.Seq)).ToList(),
             });
         }
 
@@ -254,6 +284,7 @@ namespace ThreatlessResource
         {
             switch (status)
             {
+                case -1: return "Senden fehlgeschlagen";
                 case 0: return "keine Antwort";
                 case 200: return "200 OK";
                 case 400: return "400 Ungültige Daten";
@@ -288,7 +319,11 @@ namespace ThreatlessResource
             Signing.Apply(requestHeaders, PublicKey, _privateKey, method, new Uri(url).PathAndQuery, body, _host.UtcNow);
             _host.Log("info", $"Sende {method} {path}: {what}");
             _host.After(_config.HttpTimeoutMs, () => Finish(0, null, null));
-            _host.Http(method, url, body, requestHeaders, Finish);
+            try { _host.Http(method, url, body, requestHeaders, Finish); }
+            catch (Exception e) when (!(e is OutOfMemoryException))
+            {
+                _host.After(0, () => Finish(-1, null, null));
+            }
         }
 
         private static JObject ParseObject(string body)
@@ -391,7 +426,7 @@ namespace ThreatlessResource
                 var bootId = Text(decoded?["bootId"]);
                 if (bootId == null)
                 {
-                    Pause(RetryDelay(status, headers), Boot);
+                    Pause(RetryDelay(status, headers), () => Safe("boot", Boot));
                     return;
                 }
                 var previous = BootId;
@@ -406,11 +441,10 @@ namespace ThreatlessResource
                 _pending = null;
                 _queue.Clear();
                 _connections.Clear();
-                _names.Clear();
                 _batchSeq = 0;
                 _connectionSeq = 0;
                 _lastSnapshotEmpty = false;
-                foreach (var source in _host.Players) AnnounceConnected(source);
+                foreach (var source in _host.Players) AnnounceConnected(source, Identifiers.Parse(_host.PlayerIdentifiers(source)));
                 Snapshot();
                 _host.Log("info", $"Verbunden mit Threatless: {_connections.Count} Spieler online, Boot {BootId}");
             });
@@ -427,7 +461,7 @@ namespace ThreatlessResource
             {
                 if (generation != _scheduleGeneration) return;
                 _scheduled = false;
-                Flush(reason);
+                Safe("flush", () => Flush(reason));
             });
         }
 
@@ -489,9 +523,10 @@ namespace ThreatlessResource
             }
             var batch = _pending;
             var boot = BootId;
-            InFlight = true;
             var what = string.Join(", ", batch.Events.GroupBy(e => e.Type).Select(g => g.Count() > 1 ? $"{g.Count()}x {g.Key}" : g.Key));
-            Request("POST", "/game/events", what, Body(batch), (status, response, headers) =>
+            var body = Body(batch);
+            InFlight = true;
+            Request("POST", "/game/events", what, body, (status, response, headers) =>
             {
                 InFlight = false;
                 if (boot == BootId) OnBatchResponse(batch, status, response, headers);
@@ -549,7 +584,7 @@ namespace ThreatlessResource
                 return;
             }
 
-            Pause(RetryDelay(status, headers), () => Flush(batch.Reason));
+            Pause(RetryDelay(status, headers), () => Safe("flush", () => Flush(batch.Reason)));
         }
 
         public void LogStatus() =>
