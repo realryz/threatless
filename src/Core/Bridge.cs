@@ -30,9 +30,7 @@ namespace ThreatlessResource
         {
             public long Seq;
             public string Name;
-            public string License;
-            public string DropKind;
-            public string DropAt;
+            public bool Joined;
         }
 
         private sealed class Batch
@@ -175,13 +173,14 @@ namespace ThreatlessResource
 
         private static string Plain(string text) => ConsoleUnsafe.Replace(text ?? "", "");
 
-        private void AnnounceConnected(int source, Dictionary<string, string> identifiers)
+        private void AnnounceConnected(int source, bool joined)
         {
+            var identifiers = Identifiers.Parse(_host.PlayerIdentifiers(source));
             var connection = new Connection
             {
                 Seq = ++_connectionSeq,
                 Name = Truncate(_host.PlayerName(source), 128),
-                License = LicenseOf(identifiers),
+                Joined = joined,
             };
             _connections[source] = connection;
             Enqueue(new GameEvent
@@ -195,49 +194,26 @@ namespace ThreatlessResource
             });
         }
 
-        private static string LicenseOf(Dictionary<string, string> identifiers) =>
-            identifiers.TryGetValue("license", out var license) ? license : null;
-
         public void PlayerJoined(int source)
         {
             if (!_started) return;
-            var identifiers = Identifiers.Parse(_host.PlayerIdentifiers(source));
             if (_connections.TryGetValue(source, out var known))
             {
-                var license = LicenseOf(identifiers);
-                var same = license != null || known.License != null
-                    ? license == known.License
-                    : Truncate(_host.PlayerName(source), 128) == known.Name;
-                if (same) return;
-                Close(source, known, known.DropKind ?? "quit", known.DropAt ?? Now());
+                if (!known.Joined)
+                {
+                    known.Joined = true;
+                    return;
+                }
+                Close(source, known, "quit", Now());
             }
             _host.Log("info", $"Spieler verbunden: {Plain(_host.PlayerName(source))} (ID {source})");
-            AnnounceConnected(source, identifiers);
+            AnnounceConnected(source, true);
         }
-
-        private static readonly int[] DropChecksMs = { 1000, 4000, 10000 };
 
         public void PlayerDropped(int source, string reason)
         {
             if (!_started || !_connections.TryGetValue(source, out var connection)) return;
-            connection.DropKind = ClassifyDrop(reason);
-            connection.DropAt = Now();
-            ConfirmDrop(source, connection, 0);
-        }
-
-        private void ConfirmDrop(int source, Connection connection, int attempt)
-        {
-            _host.After(DropChecksMs[attempt], () => Safe("playerDropped", () =>
-            {
-                if (!_connections.TryGetValue(source, out var current) || current != connection) return;
-                if (_host.Players.Contains(source))
-                {
-                    if (attempt + 1 < DropChecksMs.Length) ConfirmDrop(source, connection, attempt + 1);
-                    else connection.DropKind = connection.DropAt = null;
-                    return;
-                }
-                Close(source, connection, connection.DropKind, connection.DropAt);
-            }));
+            Close(source, connection, ClassifyDrop(reason), Now());
         }
 
         private void Close(int source, Connection connection, string kind, string occurredAt)
@@ -444,7 +420,7 @@ namespace ThreatlessResource
                 _batchSeq = 0;
                 _connectionSeq = 0;
                 _lastSnapshotEmpty = false;
-                foreach (var source in _host.Players) AnnounceConnected(source, Identifiers.Parse(_host.PlayerIdentifiers(source)));
+                foreach (var source in _host.Players) AnnounceConnected(source, false);
                 Snapshot();
                 _host.Log("info", $"Verbunden mit Threatless: {_connections.Count} Spieler online, Boot {BootId}");
             });
